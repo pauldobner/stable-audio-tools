@@ -162,3 +162,7 @@ cython_debug/
 *.ckpt
 *.wav
 wandb/*
+
+/
+hf_model_download/model.safetensors
+hf_model_download/model_config.json
