@@ -29,6 +29,7 @@ setup(
         'sentencepiece==0.1.99',
         'torch>=2.5.1',
         'torchaudio>=2.5.1',
+        'torchcrepe==0.0.24',
         'torchmetrics==0.11.4',
         'tqdm',
         'transformers',
