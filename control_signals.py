@@ -1,40 +1,60 @@
 import librosa
+import librosa.display
 import numpy as np
 import torch
 import torchcrepe
+from matplotlib import pyplot as plt
 
 
-def compute_loudness(audio: np.ndarray, sr: int, hop_length: int = None, n_fft: int = None, win_length: int = None) -> np.ndarray:
+def compute_loudness(
+    audio: np.ndarray,
+    sr: int,
+    hop_length: int = None,
+    n_fft: int = None,
+    win_length: int = None,
+) -> np.ndarray:
     """
-    Compute per-frame loudness as the RMS of an A-weighted magnitude spectrogram.
-    Uses A-weighting to mimic human hearing.
-    Inspired by the torchcrepe implementation, but uses RMS instead of the mean.
-    https://github.com/maxrmorrison/torchcrepe/blob/master/torchcrepe/loudness.py
+    Compute per-frame loudness by A-weighting each FFT bin of the magnitude
+    spectrogram, summing the weighted bins within a frame, and taking the RMS.
+
+    This mirrors the Sketch2Sound control signal: 5 ms hops, mono audio,
+    linear amplitude weighting derived from the A-weighting curve, and an RMS
+    envelope that can be aligned directly to the VAE latent frame rate.
     """
     if hop_length is None:
-        hop_length = int(sr / 200.)  # 5ms per frame
+        hop_length = int(sr / 200.0)  # 5 ms step
     if n_fft is None:
-        n_fft = 1024  # default FFT size
+        n_fft = 1024
     if win_length is None:
-        win_length = n_fft  # default window length
+        win_length = n_fft
 
-    S = np.abs(librosa.stft(audio, n_fft=n_fft, hop_length=hop_length, win_length=win_length))
+    audio_np = np.asarray(audio, dtype=np.float32)
+    if audio_np.ndim == 2:
+        audio_np = librosa.to_mono(audio_np)
+
+    S = np.abs(
+        librosa.stft(
+            audio_np,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+        )
+    )
     freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-
-    # Compute A-weighting (in dB)
-    A_weight_db = librosa.A_weighting(freqs)
-
-    # convert magnitude to db
-    S_db = librosa.amplitude_to_db(S)
-
-    # applies A-weighting to each frequency bin in the spectrogram
-    S_weighted = S_db + A_weight_db[:, np.newaxis]
-    # Compute RMS across frequency bins
-    loudness = np.sqrt(np.mean(S_weighted ** 2, axis=0))
+    A_weight_amp = librosa.db_to_amplitude(librosa.A_weighting(freqs))
+    weighted = S * A_weight_amp[:, np.newaxis]
+    loudness = np.sqrt(np.maximum(np.sum(weighted**2, axis=0), 1e-12))
     return loudness
 
 
-def spectral_centroid(y: np.ndarray, sr: int, hop_length: int = None, n_fft: int = None, win_length: int = None, midi: bool = True) -> np.ndarray:
+def spectral_centroid(
+    y: np.ndarray,
+    sr: int,
+    hop_length: int = None,
+    n_fft: int = None,
+    win_length: int = None,
+    midi: bool = True,
+) -> np.ndarray:
     """
     Compute the spectral centroid per frame and convert it to MIDI values (semitones),
     scaled to roughly (0, 1) by dividing by 127.
@@ -45,14 +65,15 @@ def spectral_centroid(y: np.ndarray, sr: int, hop_length: int = None, n_fft: int
 
     """
     if hop_length is None:
-        hop_length = int(sr / 200.)  # 5ms per frame
+        hop_length = int(sr / 200.0)  # 5ms per frame
     if n_fft is None:
         n_fft = 1024  # default FFT size
     if win_length is None:
         win_length = n_fft  # default window length
-        
+
     centroid_hz = librosa.feature.spectral_centroid(
-        y=y, sr=sr, hop_length=hop_length, n_fft=n_fft, win_length=win_length)[0]
+        y=y, sr=sr, hop_length=hop_length, n_fft=n_fft, win_length=win_length
+    )[0]
     # Ensure no zero values for safe logarithm calculation
     centroid_hz = np.maximum(centroid_hz, 1e-6)
     if midi:
@@ -63,7 +84,13 @@ def spectral_centroid(y: np.ndarray, sr: int, hop_length: int = None, n_fft: int
     return centroid_hz
 
 
-def extract_pitch_probability(audio: np.ndarray | torch.Tensor, sr: int, hop_length: int = None, model: str = 'tiny', device: str = 'cuda:0') -> np.ndarray:
+def extract_pitch_probability(
+    audio: np.ndarray | torch.Tensor,
+    sr: int,
+    hop_length: int = None,
+    model: str = "tiny",
+    device: str = "cuda:0",
+) -> np.ndarray:
     """
     Extract the raw pitch probabilities (and hence periodicity) using torchcrepe.
 
@@ -80,7 +107,7 @@ def extract_pitch_probability(audio: np.ndarray | torch.Tensor, sr: int, hop_len
 
     # Use a 5 ms hop (i.e., sr/200) if not specified
     if hop_length is None:
-        hop_length = int(sr / 200.)
+        hop_length = int(sr / 200.0)
 
     # torchcrepe.preprocess returns a generator of batches; get the first batch.
     batch = next(torchcrepe.preprocess(audio, sr, hop_length))
@@ -91,7 +118,26 @@ def extract_pitch_probability(audio: np.ndarray | torch.Tensor, sr: int, hop_len
 
     # Zero out all probabilities below 0.1 to avoid leaking timbral information
     pitch_probs = torch.where(
-        pitch_probs < 0.1, torch.zeros_like(pitch_probs), pitch_probs)
+        pitch_probs < 0.1, torch.zeros_like(pitch_probs), pitch_probs
+    )
     pitch_probs = pitch_probs.cpu()
     torch.cuda.empty_cache()
     return pitch_probs.numpy()
+
+
+
+
+if __name__ == "__main__":
+    # test the functions
+    example_audio = "example_audio/in.wav"
+
+    y, sr = librosa.load(example_audio, sr=None)
+    loudness = compute_loudness(y, sr)
+    centroid = spectral_centroid(y, sr)
+    pitch_probs = extract_pitch_probability(y, sr)
+    # print shapes
+    print("Audio shape:", y.shape)
+    print("Sample Rate:", sr)
+    print("Loudness shape:", loudness.shape)
+    print("Spectral Centroid shape:", centroid.shape)
+    print("Pitch Probability shape:", pitch_probs.shape)
