@@ -1,0 +1,12 @@
+{
+    "dataset_type": "pre_encoded",
+    "datasets": [
+        {
+            "id": "audiocaps-train-latents",
+            "path": "/home/paul/Projects/stable-audio-tools/preencoded/audiocaps/train"
+        }
+    ],
+    "random_crop": true,
+    "latent_crop_length": 1024,
+    "drop_last": true
+}

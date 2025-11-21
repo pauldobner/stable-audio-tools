@@ -1,6 +1,8 @@
 import torch
 from torch.nn import Parameter
+
 from ..models.factory import create_model_from_config
+
 
 def create_training_wrapper_from_config(model_config, model):
     model_type = model_config.get('model_type', None)
@@ -94,8 +96,10 @@ def create_training_wrapper_from_config(model_config, model):
                 discriminator = create_model_from_config(discriminator_model_config)
 
                 discriminator_model_ckpt = arc_config.get("discriminator_base_ckpt", None)
+                if discriminator_model_ckpt == "":
+                    discriminator_model_ckpt = None
                 if discriminator_model_ckpt is not None:
-                    discriminator.load_state_dict(torch.load(discriminator_model_ckpt, weights_only=True)["state_dict"], strict=False)
+                    discriminator.load_state_dict(torch.load(discriminator_model_ckpt, weights_only=False)["state_dict"], strict=False)
 
             return ARCTrainingWrapper(
                 model=model,

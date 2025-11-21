@@ -11,8 +11,10 @@ from torch.nn import functional as F
 from stable_audio_tools.data.dataset import create_dataloader_from_config
 from stable_audio_tools.models.factory import create_model_from_config
 from stable_audio_tools.models.pretrained import get_pretrained_model
-from stable_audio_tools.models.utils import load_ckpt_state_dict, copy_state_dict
+from stable_audio_tools.models.utils import copy_state_dict, load_ckpt_state_dict
 
+# set precision to fully utilize Tensor Cores on NVIDIA GPUs
+torch.set_float32_matmul_precision('medium')
 
 def load_model(model_config=None, model_ckpt_path=None, pretrained_name=None, model_half=False):
     if pretrained_name is not None:

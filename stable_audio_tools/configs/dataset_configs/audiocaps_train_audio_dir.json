@@ -1,0 +1,12 @@
+{
+    "dataset_type": "audio_dir",
+    "datasets": [
+        {
+            "id": "audiocaps",
+            "path": "/home/paul/Projects/stable-audio-tools/dataset/audioset",
+            "custom_metadata_module": "/home/paul/Projects/stable-audio-tools/dataset/metadata/audiocaps/custom_metadata_train.py"
+        }
+    ],
+    "random_crop": true,
+    "drop_last": true
+}

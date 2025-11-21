@@ -164,5 +164,7 @@ cython_debug/
 wandb/*
 
 /
-hf_model_download/model.safetensors
-hf_model_download/model_config.json
+runs/
+preencoded/
+dataset/
+hf_model_download

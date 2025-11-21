@@ -1,14 +1,25 @@
-import torch
 import json
 import os
-import pytorch_lightning as pl
-
 from typing import Dict, Optional, Union
+
+import pytorch_lightning as pl
+import torch
 from prefigure.prefigure import get_all_args, push_wandb_config
+
 from stable_audio_tools.data.dataset import create_dataloader_from_config, fast_scandir
 from stable_audio_tools.models import create_model_from_config
-from stable_audio_tools.models.utils import copy_state_dict, load_ckpt_state_dict, remove_weight_norm_from_model
-from stable_audio_tools.training import create_training_wrapper_from_config, create_demo_callback_from_config
+from stable_audio_tools.models.utils import (
+    copy_state_dict,
+    load_ckpt_state_dict,
+    remove_weight_norm_from_model,
+)
+from stable_audio_tools.training import (
+    create_demo_callback_from_config,
+    create_training_wrapper_from_config,
+)
+
+# set torch precision to utilize tensor cores
+torch.set_float32_matmul_precision('medium')
 
 class ExceptionCallback(pl.Callback):
     def on_exception(self, trainer, module, err):
@@ -20,6 +31,22 @@ class ModelConfigEmbedderCallback(pl.Callback):
 
     def on_save_checkpoint(self, trainer, pl_module, checkpoint):
         checkpoint["model_config"] = self.model_config
+
+class LoraCallback(pl.Callback):
+    def __init__(self, lora_enabled, checkpoint_every, checkpoint_dir):
+        self.lora_enabled = lora_enabled
+        self.checkpoint_every = checkpoint_every
+        self.checkpoint_dir = checkpoint_dir
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not self.lora_enabled:
+            return
+
+        global_step = trainer.global_step
+        if global_step > 0 and global_step % self.checkpoint_every == 0:
+            peft_model = pl_module.model.model # Get the PEFT model
+            lora_save_path = os.path.join(self.checkpoint_dir, f"lora_step_{global_step}")
+            peft_model.save_pretrained(lora_save_path)
 
 def main():
     torch.multiprocessing.set_sharing_strategy('file_system')
@@ -35,6 +62,11 @@ def main():
     #Get JSON config from args.model_config
     with open(args.model_config) as f:
         model_config = json.load(f)
+    
+    if args.lora:
+        model_config["use_lora"] = True
+    else:
+        model_config["use_lora"] = False
 
     with open(args.dataset_config) as f:
         dataset_config = json.load(f)
@@ -104,6 +136,7 @@ def main():
         
     ckpt_callback = pl.callbacks.ModelCheckpoint(every_n_train_steps=args.checkpoint_every, dirpath=checkpoint_dir, save_top_k=-1)
     save_model_config_callback = ModelConfigEmbedderCallback(model_config)
+    lora_callback = LoraCallback(args.lora, args.checkpoint_every, checkpoint_dir)
 
     if args.val_dataset_config:
         demo_callback = create_demo_callback_from_config(model_config, demo_dl=val_dl)
@@ -152,7 +185,7 @@ def main():
         strategy=strategy,
         precision=args.precision,
         accumulate_grad_batches=args.accum_batches, 
-        callbacks=[ckpt_callback, demo_callback, exc_callback, save_model_config_callback],
+        callbacks=[ckpt_callback, demo_callback, exc_callback, save_model_config_callback, lora_callback],
         logger=logger,
         log_every_n_steps=1,
         max_epochs=10000000,

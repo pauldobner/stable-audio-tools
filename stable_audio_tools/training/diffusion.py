@@ -347,6 +347,11 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         p.tick("setup")
 
         #with torch.amp.autocast(device_type="cuda"):
+        
+        # Inject audio into metadata for control signal conditioners
+        for i in range(len(metadata)):
+            metadata[i]["audio"] = reals[i]
+            
         conditioning = self.diffusion.conditioner(metadata, self.device)
 
         # If mask_padding is on, randomly drop the padding masks to allow for learning silence padding
@@ -646,6 +651,27 @@ class DiffusionCondDemoCallback(pl.Callback):
         if self.demo_cond_from_batch:
             # Get metadata from the batch
             demo_cond = batch[1][:self.num_demos]
+        elif isinstance(demo_cond, list):
+            demo_cond = demo_cond[:self.num_demos]
+            
+            # Load audio from files if specified
+            for i, cond in enumerate(demo_cond):
+                if "audio_file" in cond:
+                    audio_path = cond["audio_file"]
+                    print(f"Loading demo audio from {audio_path}")
+                    audio, sr = torchaudio.load(audio_path)
+                    if sr != self.sample_rate:
+                        resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+                        audio = resampler(audio)
+                    
+                    # Ensure correct length (crop or pad)
+                    target_length = self.demo_samples
+                    if audio.shape[-1] > target_length:
+                        audio = audio[..., :target_length]
+                    elif audio.shape[-1] < target_length:
+                        audio = F.pad(audio, (0, target_length - audio.shape[-1]))
+                        
+                    cond["audio"] = audio.to(module.device)
 
         if module.diffusion.pretransform is not None:
             demo_samples = demo_samples // module.diffusion.pretransform.downsampling_ratio

@@ -1,0 +1,12 @@
+{
+    "dataset_type": "pre_encoded",
+    "datasets": [
+        {
+            "id": "audiocaps-val-latents",
+            "path": "/home/paul/Projects/stable-audio-tools/preencoded/audiocaps/val"
+        }
+    ],
+    "random_crop": false,
+    "latent_crop_length": 1024,
+    "drop_last": false
+}

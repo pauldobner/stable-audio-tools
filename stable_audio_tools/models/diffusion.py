@@ -1,21 +1,35 @@
+import random
+import typing as tp
+from functools import partial
+from time import time
+
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from functools import partial
-import numpy as np
-import typing as tp
-import random
 
-from .blocks import ResConvBlock, FourierFeatures, Upsample1d, Upsample1d_2, Downsample1d, Downsample1d_2, SelfAttention1d, SkipBlock, expand_to_planes
-from .conditioners import MultiConditioner, create_multi_conditioner_from_conditioning_config
+from ..inference.generation import generate_diffusion_cond
+from ..inference.sampling import DistributionShift
+from .blocks import (
+    Downsample1d,
+    Downsample1d_2,
+    FourierFeatures,
+    ResConvBlock,
+    SelfAttention1d,
+    SkipBlock,
+    Upsample1d,
+    Upsample1d_2,
+    expand_to_planes,
+)
+from .conditioners import (
+    MultiConditioner,
+    create_multi_conditioner_from_conditioning_config,
+)
 from .dit import DiffusionTransformer
 from .factory import create_pretransform_from_config
 from .pretransforms import Pretransform
 from .transformer import ContinuousTransformer
-from ..inference.generation import generate_diffusion_cond
-from ..inference.sampling import DistributionShift
 
-from time import time
 
 class Profiler:
 
@@ -541,8 +555,8 @@ class DiTWrapper(ConditionedDiffusionModel):
         #assert negative_input_concat_cond is None, "negative_input_concat_cond is not supported for DiTWrapper"
 
         return self.model(
-            x,
-            t,
+            x=x,
+            t=t,
             cross_attn_cond=cross_attn_cond,
             cross_attn_cond_mask=cross_attn_mask,
             negative_cross_attn_cond=negative_cross_attn_cond,
@@ -649,6 +663,19 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
         diffusion_model = UNet1DCondWrapper(**diffusion_model_config)
     elif diffusion_model_type == 'dit':
         diffusion_model = DiTWrapper(diffusion_objective=diffusion_objective, **diffusion_model_config)
+
+    # Add PEFT LoRA
+    if config.get("use_lora", False):
+        from peft import LoraConfig, TaskType, get_peft_model
+        lora_config = LoraConfig(
+            r=2,
+            lora_alpha=16,
+            target_modules=["to_q", "to_kv"],
+            lora_dropout=0.05,
+            bias="none",
+        )
+        diffusion_model.model = get_peft_model(diffusion_model.model, lora_config)
+        diffusion_model.model.print_trainable_parameters()
 
     io_channels = model_config.get('io_channels', None)
     assert io_channels is not None, "Must specify io_channels in model config"
