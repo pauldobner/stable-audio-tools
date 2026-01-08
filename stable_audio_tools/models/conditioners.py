@@ -1,20 +1,23 @@
 #Heavily influenced by https://github.com/facebookresearch/audiocraft/blob/main/audiocraft/modules/conditioners.py
 
-import torch
-import logging, warnings
+import gc
+import logging
 import string
 import typing as tp
-import gc
+import warnings
+import numpy as np
 
-from .adp import NumberEmbedder
+import torch
+from torch import nn
+
+from .. import control_signals
 from ..inference.utils import set_audio_channels
+from .adp import NumberEmbedder
 from .factory import create_pretransform_from_config
 from .pretransforms import Pretransform
-from .utils import load_ckpt_state_dict
 from .transformer import AbsolutePositionalEmbedding
-from .. import control_signals
+from .utils import load_ckpt_state_dict
 
-from torch import nn
 
 class Conditioner(nn.Module):
     def __init__(
@@ -318,7 +321,7 @@ class T5Conditioner(Conditioner):
         assert t5_model_name in self.T5_MODELS, f"Unknown T5 model name: {t5_model_name}"
         super().__init__(self.T5_MODEL_DIMS[t5_model_name], output_dim, project_out=project_out)
         
-        from transformers import T5EncoderModel, AutoTokenizer
+        from transformers import AutoTokenizer, T5EncoderModel
 
         self.max_length = max_length
         self.enable_grad = enable_grad
@@ -656,16 +659,26 @@ class ControlSignalConditioner(Conditioner):
         sample_rate: int,
         hop_length: int,
         input_dim: int = 1,
-        project_out: bool = False,
-        device: str = "cuda"
+        project_out: bool = True,
+        device: str = "cuda",
+        filter_during_training: bool = True,
+        random_filter_min_size: int = 1,
+        random_filter_max_size: int = 25,
+        filter_during_inference: bool = True,
+        inference_filter_size: int = 10
     ):
-        # The control signals are 1D (scalar per frame) or multi-dimensional (pitch bins)
         super().__init__(input_dim, output_dim, project_out=project_out)
         
         self.control_type = control_type
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.device = device
+        
+        self.filter_during_training = filter_during_training
+        self.random_filter_min_size = random_filter_min_size
+        self.random_filter_max_size = random_filter_max_size
+        self.filter_during_inference = filter_during_inference
+        self.inference_filter_size = inference_filter_size
         
         valid_types = ["loudness", "centroid", "pitch"]
         assert control_type in valid_types, f"control_type must be one of {valid_types}"
@@ -674,37 +687,30 @@ class ControlSignalConditioner(Conditioner):
         
         self.proj_out.to(device)
         
-        if isinstance(audios, list):
-            # Find max length to pad
-            max_len = max([a.shape[-1] for a in audios])
-            padded_audios = []
-            for audio in audios:
-                # audio shape: (channels, samples)
-                if audio.shape[-1] < max_len:
-                    padding = torch.zeros(audio.shape[0], max_len - audio.shape[-1]).to(audio)
-                    padded_audios.append(torch.cat([audio, padding], dim=-1))
-                else:
-                    padded_audios.append(audio)
-            audios = torch.stack(padded_audios, dim=0)
-            
-        # audios shape: (batch, channels, samples)
-        
-        # Convert to mono for feature extraction
-        if audios.dim() == 3:
-            audios_mono = audios.mean(dim=1) # (batch, samples)
-        else:
-            audios_mono = audios
-            
-        batch_size = audios_mono.shape[0]
+        if isinstance(audios, torch.Tensor):
+            if audios.dim() == 2:
+                audios = [audios[i] for i in range(audios.shape[0])]
+            elif audios.dim() == 3:
+                audios = [audios[i] for i in range(audios.shape[0])]
         
         extracted_signals = []
+
+        # Determine filter size
+        filter_size = 1
+        if self.training:
+            if self.filter_during_training:
+                filter_size = np.random.randint(self.random_filter_min_size, self.random_filter_max_size + 1)
+        else:
+            if self.filter_during_inference:
+                filter_size = self.inference_filter_size
         
-        # Process each item in the batch
-        # Note: control_signals functions work on numpy arrays mostly, except pitch which handles torch tensors
-        # We'll process item by item for safety and simplicity with the provided librosa-based code
-        
-        for i in range(batch_size):
-            audio_np = audios_mono[i].detach().cpu().numpy()
+        for audio in audios:
+            if audio.dim() > 1:
+                audio_mono = audio.mean(dim=0)
+            else:
+                audio_mono = audio
+
+            audio_np = audio_mono.detach().cpu().numpy()
             
             if self.control_type == "loudness":
                 signal = control_signals.compute_loudness(
@@ -712,136 +718,46 @@ class ControlSignalConditioner(Conditioner):
                     self.sample_rate, 
                     hop_length=self.hop_length
                 )
+                if filter_size > 1:
+                    signal = control_signals.apply_median_filter(signal, filter_size)
+                signal = torch.from_numpy(signal).float().to(device).unsqueeze(1) # (frames, 1)
+
             elif self.control_type == "centroid":
                 signal = control_signals.spectral_centroid(
                     audio_np, 
                     self.sample_rate, 
                     hop_length=self.hop_length
                 )
+                if filter_size > 1:
+                    signal = control_signals.apply_median_filter(signal, filter_size)
+                signal = torch.from_numpy(signal).float().to(device).unsqueeze(1) # (frames, 1)
+
             elif self.control_type == "pitch":
-                # extract_pitch_probability handles torch tensors and device
-                # It expects (1, n_samples) or (n_samples,)
-                # It returns probabilities. The paper/code implies we might want the raw probability or a specific processing.
-                # control_signals.extract_pitch_probability returns pitch_probs
-                
-                # We pass the tensor directly to avoid cpu roundtrip if possible, 
-                # but the function signature says "audio: np.ndarray | torch.Tensor"
-                # and it uses torchcrepe.
-                
-                signal = control_signals.extract_pitch_probability(
-                    audios_mono[i], 
+                signal_np = control_signals.extract_pitch_probability(
+                    audio_mono, 
                     self.sample_rate, 
                     hop_length=self.hop_length,
                     device=str(device)
                 )
-                
-                # Signal is (n_frames, 360) or similar?
-                # Wait, extract_pitch_probability returns pitch_probs. 
-                # torchcrepe.infer returns (batch, time, 360) usually? 
-                # Let's check control_signals.py again.
-                # It returns pitch_probs.numpy().
-                # And it does `pitch_probs = torchcrepe.infer(...)`.
-                # If model='tiny', it returns probabilities over pitch bins.
-                # But we initialized the conditioner with dim=1.
-                # If the signal is high-dimensional (like pitch probs), we need to adjust.
-                # The paper says "single linear adapter layer per control signal".
-                # If it's pitch *probability*, it's likely a vector per frame.
-                # If it's just f0, it's a scalar.
-                # control_signals.py docstring: "Extract the raw pitch probabilities... Uses the CREPE 'tiny' variant."
-                # So it returns a vector of probabilities (360 bins usually).
-                # I need to check the dimensionality.
-                pass
-
-            # Handle dimensionality
-            # Loudness: (n_frames,) -> Scalar
-            # Centroid: (n_frames,) -> Scalar
-            # Pitch: Likely (n_frames, 360)
-            
-            if self.control_type == "pitch":
-                # For pitch, the signal is likely multi-dimensional (bins)
-                # We need to handle this.
-                # If it's 360 bins, we should project 360 -> output_dim.
-                # But I initialized super().__init__(1, ...) assuming scalar.
-                # I need to fix this logic.
-                pass
+                if filter_size > 1:
+                    signal_np = control_signals.apply_median_filter(signal_np, filter_size)
+                signal = torch.from_numpy(signal_np).float().to(device).squeeze(0) # (frames, 360)
             
             extracted_signals.append(signal)
 
-        # Re-evaluating Pitch dimensionality
-        # If control_type is pitch, we need to know the input dimension.
-        # CREPE usually has 360 bins.
-        # I will update the __init__ to handle this.
-        
-        # Let's assume for now I'll fix the __init__ logic in the next step or do it dynamically?
-        # No, I should do it right here.
-        # I will change the logic below to stack and project.
-        
-        # Convert list of numpy arrays to tensor
-        # signals are (time, [bins])
-        
-        # Pad signals to same length if needed (though if audio was padded, signals should be roughly same length)
-        max_sig_len = max([s.shape[0] for s in extracted_signals])
-        
+        max_len = max([s.shape[0] for s in extracted_signals])
         padded_signals = []
         for s in extracted_signals:
-            s_tensor = torch.tensor(s).to(device).float()
-            if s_tensor.dim() == 1:
-                s_tensor = s_tensor.unsqueeze(1) # (time, 1)
+            if s.shape[0] < max_len:
+                padding = torch.zeros(max_len - s.shape[0], s.shape[1]).to(device)
+                s = torch.cat([s, padding], dim=0)
+            padded_signals.append(s)
             
-            # s_tensor is (time, channels)
-            
-            if s_tensor.shape[0] < max_sig_len:
-                padding = torch.zeros(max_sig_len - s_tensor.shape[0], s_tensor.shape[1]).to(device)
-                s_tensor = torch.cat([s_tensor, padding], dim=0)
-                
-            padded_signals.append(s_tensor)
-            
-        # Stack: (batch, time, channels)
-        signals_tensor = torch.stack(padded_signals, dim=0)
+        signals_tensor = torch.stack(padded_signals, dim=0) # (batch, frames, input_dim)
         
-        # Permute to (batch, channels, time) for consistency with some other parts? 
-        # But Conditioner usually expects (batch, time, channels) for the projection input?
-        # The other conditioners return [embeddings, mask] where embeddings is (batch, 1, dim) or (batch, seq, dim).
-        # Here we have a sequence.
+        embeddings = self.proj_out(signals_tensor) # (batch, frames, output_dim)
         
-        # Project
-        # self.proj_out expects (..., dim_in)
-        # So (batch, time, channels) is correct.
-        
-        embeddings = self.proj_out(signals_tensor) # (batch, time, output_dim)
-        
-        # Transpose to (batch, output_dim, time) if that's what's expected?
-        # Wait, T5Conditioner returns (batch, seq, dim).
-        # But ConditionedDiffusionModelWrapper.get_conditioning_inputs handles it.
-        # If using input_concat_ids, it expects (batch, channels, seq).
-        # So I should probably return (batch, output_dim, time).
-        
-        # However, the other conditioners (like T5) return (batch, seq, dim).
-        # And get_conditioning_inputs says:
-        # "Concatenate all input concat conditioning inputs over the channel dimension... Assumes ... (batch, channels, seq)"
-        # But T5 is usually Cross Attention (batch, seq, channels).
-        
-        # If I want to use this for `input_concat_ids`, I should return (batch, channels, seq).
-        # But `Conditioner` interface seems to return (batch, seq, channels) generally (like T5).
-        # Let's look at `SourceMixConditioner`. It returns `[mixes, mask]`.
-        # `mixes` is `torch.stack(mixes, dim=0)`.
-        # `mix` comes from `self.source_heads[key_ix](latents)`.
-        # `latents` from `pretransform.encode` is (batch, channels, time).
-        # `Conv1d` preserves (batch, channels, time).
-        # So `SourceMixConditioner` returns (batch, channels, time).
-        
-        # So if I want to support `input_concat`, I should return (batch, channels, time).
-        # If I want to support `cross_attn`, I should return (batch, time, channels).
-        
-        # The paper says "single linear adapter layer".
-        # If I use `nn.Linear`, it works on the last dimension.
-        # If I have (batch, time, 1), Linear -> (batch, time, out_dim).
-        # If I want (batch, out_dim, time), I transpose.
-        
-        # Given these are "control signals" like envelopes, they are usually concatenated (Dense control).
-        # So I should target (batch, out_dim, time).
-        
-        embeddings = embeddings.transpose(1, 2) # (batch, output_dim, time)
+        embeddings = embeddings.transpose(1, 2) # (batch, output_dim, frames)
         
         return [embeddings, torch.ones(embeddings.shape[0], embeddings.shape[2]).to(device)]
 
@@ -975,20 +891,15 @@ def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.An
         elif conditioner_type == "control_signal":
             # Determine input dimension based on control type
             control_type = conditioner_config.get("control_type")
-            if control_type == "pitch":
-                # CREPE tiny model output dimension is 360
-                input_dim = 360
-            else:
-                # Loudness and Centroid are scalars
-                input_dim = 1
+            if "input_dim" not in conditioner_config:
+                if control_type == "pitch":
+                    # CREPE tiny model output dimension is 360
+                    conditioner_config["input_dim"] = 360
+                else:
+                    # Loudness and Centroid are scalars
+                    conditioner_config["input_dim"] = 1
             
-            # Update the conditioner class to handle the input dim
-            # We need to instantiate the class with the correct input dim
-            # But the class __init__ I wrote above hardcoded 1. 
-            # I will modify the class __init__ in the previous chunk to accept input_dim or infer it.
-            # Actually, I'll just pass input_dim to the constructor.
-            
-            conditioners[id] = ControlSignalConditioner(input_dim=input_dim, **conditioner_config)
+            conditioners[id] = ControlSignalConditioner(**conditioner_config)
         else:
             raise ValueError(f"Unknown conditioner type: {conditioner_type}")
 

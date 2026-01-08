@@ -507,6 +507,10 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         diffusion_input = reals
 
         with torch.cuda.amp.autocast() and torch.no_grad():
+            # Inject audio into metadata for control signal conditioners
+            for i in range(len(metadata)):
+                metadata[i]["audio"] = reals[i]
+
             conditioning = self.diffusion.conditioner(metadata, self.device)
 
         # TODO: decide what to do with padding masks during validation

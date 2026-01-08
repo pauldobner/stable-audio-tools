@@ -4,6 +4,29 @@ import numpy as np
 import torch
 import torchcrepe
 from matplotlib import pyplot as plt
+from scipy.ndimage import median_filter as scipy_median_filter
+
+
+def apply_median_filter(signal: np.ndarray, win_length: int) -> np.ndarray:
+    """
+    Apply a median filter to the signal along the time dimension.
+    Supports 1D (time,) and 3D (batch, time, features) arrays.
+    """
+    if win_length <= 1:
+        return signal
+
+    if signal.ndim == 1:
+        # 1D array: (time,)
+        return scipy_median_filter(signal, size=win_length, mode='nearest')
+    elif signal.ndim == 3:
+        # 3D array: (batch, time, features)
+        # Filter along axis 1
+        return scipy_median_filter(signal, size=(1, win_length, 1), mode='nearest')
+    else:
+        # Fallback for 2D (time, features)
+        if signal.ndim == 2:
+             return scipy_median_filter(signal, size=(win_length, 1), mode='nearest')
+        raise ValueError(f"Unsupported signal shape for median filtering: {signal.shape}")
 
 
 def compute_loudness(

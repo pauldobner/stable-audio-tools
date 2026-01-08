@@ -136,11 +136,13 @@ class LocalDatasetConfig:
         self,
         id: str,
         path: str,
-        custom_metadata_fn: Optional[Callable[[str], str]] = None
+        custom_metadata_fn: Optional[Callable[[str], str]] = None,
+        filter_fn: Optional[Callable[[List[str], str], List[str]]] = None
     ):
         self.id = id
         self.path = path
         self.custom_metadata_fn = custom_metadata_fn
+        self.filter_fn = filter_fn
 
 class SampleDataset(torch.utils.data.Dataset):
     def __init__(
@@ -176,7 +178,10 @@ class SampleDataset(torch.utils.data.Dataset):
 
         for config in configs:
             self.root_paths.append(config.path)
-            self.filenames.extend(get_audio_filenames(config.path, keywords))
+            filenames = get_audio_filenames(config.path, keywords)
+            if config.filter_fn is not None:
+                filenames = config.filter_fn(filenames, config.path)
+            self.filenames.extend(filenames)
             if config.custom_metadata_fn is not None:
                 self.custom_metadata_fns[config.path] = config.custom_metadata_fn
 
@@ -833,11 +838,16 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
 
                 custom_metadata_fn = metadata_module.get_custom_metadata
 
+            filter_fn = None
+            if hasattr(metadata_module, "filter_filenames"):
+                filter_fn = metadata_module.filter_filenames
+
             configs.append(
                 LocalDatasetConfig(
                     id=audio_dir_config["id"],
                     path=audio_dir_path,
-                    custom_metadata_fn=custom_metadata_fn
+                    custom_metadata_fn=custom_metadata_fn,
+                    filter_fn=filter_fn
                 )
             )
 
